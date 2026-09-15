@@ -1,0 +1,220 @@
+STEP1: calculate LD score
+
+# STEP1.1: Filter variants by MAF to reduce the size of the binary PLINK files.
+
+plink2 \
+--bfile "Q0_unre_Caucasian_c${chr}" \
+--make-bed \
+--maf 0.0001 \
+--out "chr${chr}"
+
+# STEP1.2: Calculate chromosome-specific LD scores.
+
+gcta \
+--bfile "chr${chr}" \
+--ld-score-region 200 \
+--ld-wind 1000 \
+--threads 64 \
+--out "ldscores/chr${chr}"
+
+cat ldscores/*.score.ld > ldscores/allChr.score.ld
+
+STEP2: build SNP info
+
+import pandas as pd
+ldFilePath = "ldscores/allChr.score.ld"
+savePath = "snp_info.csv"
+
+# STEP2.1: Read the required columns from the LD score file.
+lds_seg = pd.read_csv(
+  ldFilePath,
+  sep=r"\s+",
+  usecols=["SNP", "ldscore_SNP", "freq"],
+  dtype={
+    "SNP": str,
+    "ldscore_SNP": float,
+    "freq": float
+  }
+)
+
+# STEP2.2: Divide variants into four MAF groups.
+maf1 = lds_seg[lds_seg["freq"] >= 0.1]
+maf2 = lds_seg[(lds_seg["freq"] < 0.1) & (lds_seg["freq"] >= 0.01)]
+maf3 = lds_seg[(lds_seg["freq"] < 0.01) & (lds_seg["freq"] >= 0.001)]
+maf4 = lds_seg[lds_seg["freq"] < 0.001]
+
+# STEP2.3: Divide each MAF group into two groups using the median LD score.
+def split_ld(df):
+  if df.empty:
+    return pd.Series([], dtype=str), pd.Series([], dtype=str)
+  median_ld = df["ldscore_SNP"].median()
+  ld1 = df[df["ldscore_SNP"] <= median_ld]["SNP"]
+  ld2 = df[df["ldscore_SNP"] > median_ld]["SNP"]
+  return ld1, ld2
+
+maf1_ld1, maf1_ld2 = split_ld(maf1)
+maf2_ld1, maf2_ld2 = split_ld(maf2)
+maf3_ld1, maf3_ld2 = split_ld(maf3)
+maf4_ld1, maf4_ld2 = split_ld(maf4)
+
+# STEP2.4: Combine all SNPs and remove duplicates.
+all_snps = pd.concat([
+  maf1_ld1, maf1_ld2,
+  maf2_ld1, maf2_ld2,
+  maf3_ld1, maf3_ld2,
+  maf4_ld1, maf4_ld2
+]).drop_duplicates().reset_index(drop=True)
+
+all_snps = pd.DataFrame({"SNP": all_snps})
+
+# STEP2.5: Create empty columns for the eight MAF-LD groups.
+snp_info = all_snps.copy()
+
+for col in [
+  "maf1_ld1", "maf1_ld2",
+  "maf2_ld1", "maf2_ld2",
+  "maf3_ld1", "maf3_ld2",
+  "maf4_ld1", "maf4_ld2"
+]:
+  snp_info[col] = ""
+
+# STEP2.6: Mark SNP membership in each MAF-LD group.
+def mark_snps(snp_list, col_name):
+  snp_info.loc[snp_info["SNP"].isin(snp_list), col_name] = 1
+mark_snps(maf1_ld1, "maf1_ld1")
+mark_snps(maf1_ld2, "maf1_ld2")
+mark_snps(maf2_ld1, "maf2_ld1")
+mark_snps(maf2_ld2, "maf2_ld2")
+mark_snps(maf3_ld1, "maf3_ld1")
+mark_snps(maf3_ld2, "maf3_ld2")
+mark_snps(maf4_ld1, "maf4_ld1")
+mark_snps(maf4_ld2, "maf4_ld2")
+
+STEP3: build MPH GRM
+
+# STEP3.1: Convert chromosome-specific binary PLINK files to PGEN format.
+ls chr*.bed | grep -v split | sed 's/\.bed$//' | sort -V > merge_list.txt
+mkdir -p pfile
+
+cat merge_list.txt | xargs -n 1 -P 3 -I {} bash -c '
+  prefix={}
+  chr=$(basename "$prefix")
+  plink2 \
+    --bfile "$prefix" \
+    --make-pgen \
+    --threads 2 \
+    --memory 40000 \
+    --out "pfile/$chr"
+'
+
+# STEP3.2: Merge all chromosome-specific PGEN files.
+ls pfile/chr*.pgen | sed 's/\.pgen$//' | sort -V > pfile/pmerge_list.txt
+
+plink2 \
+--pmerge-list pfile/pmerge_list.txt \
+--make-pgen \
+--threads 8 \
+--memory 240000 \
+--out pfile/allChr_merged
+
+# STEP3.3: Convert the merged PGEN dataset back to binary PLINK format for MPH.
+plink2 \
+--pfile pfile/allChr_merged \
+--make-bed \
+--threads 8 \
+--memory 240000 \
+--out allChr_merged
+
+# STEP3.4: Construct an MPH GRM component.
+mafLevel=1
+ldLevel=1
+
+mph \
+--make_grm \
+--bfile allChr_merged \
+--min_maf 0 \
+--min_hwe_pval 1e-8 \
+--snp_info snp_info.csv \
+--snp_weight maf${mafLevel}_ld${ldLevel} \
+--num_threads 100 \
+--out grm/maf${mafLevel}_ld${ldLevel}
+
+
+STEP4: relatedness refinement
+
+# STEP4.1: Extract common variants with MAF greater than 0.01.
+plink2 \
+--pfile pfile/allChr_merged \
+--maf 0.01 \
+--make-bed \
+--threads 8 \
+--memory 240000 \
+--out allChr_merged_maf_gt_0.01
+
+# STEP4.2: Construct the common-variant GCTA GRM in ten parts.
+for i in {1..10}; do
+  gcta \
+  --bfile allChr_merged_maf_gt_0.01 \
+  --make-grm-alg 1 \
+  --make-grm-part 10 ${i} \
+  --threads 64 \
+  --out gcta_common/common_part${i}
+done
+
+cat gcta_common/common_part*.grm.N.bin > gcta_common/common.grm.N.bin
+cat gcta_common/common_part*.grm.bin > gcta_common/common.grm.bin
+cat gcta_common/common_part*.grm.id > gcta_common/common.grm.id
+
+# STEP4.3: Apply a genomic relationship cutoff of 0.05 to obtain unrelated samples.
+gcta \
+--grm gcta_common/common \
+--grm-cutoff 0.05 \
+--make-grm \
+--threads 64 \
+--out gcta_common/unrelated_cutoff005
+
+awk '{print $2}' \
+gcta_common/unrelated_cutoff005.grm.id \
+> gcta_common/unrelated_cutoff005_iid.txt
+
+# STEP4.4: Subset the MPH GRM component to the unrelated sample set.
+mafLevel=1
+ldLevel=1
+
+mph \
+--binary_grm_file grm/maf${mafLevel}_ld${ldLevel} \
+--keep gcta_common/unrelated_cutoff005_iid.txt \
+--subset_grm \
+--output_file grm_unrelated/maf${mafLevel}_ld${ldLevel}
+
+# STEP4.5: Generate the MPH GRM list after all unrelated GRM components are created.
+ls grm_unrelated/*.grm.bin | sed 's/\.grm\.bin$//' | sort \
+> grm_unrelated/grm_list.txt
+
+
+STEP5: Heritability
+
+mph \
+--grm_list /grm_1e4_unrelated/grm_list.txt \
+--phenotype_file pheno.csv \
+--trait ${pheno} \
+--covariate_file cov.csv \
+--covariate_names sex,age,PC1,PC2,PC3,PC4,PC5,PC6,PC7,PC8,PC9,PC10,PC11,PC12,PC13,PC14,PC15,PC16,PC17,PC18,PC19,PC20 \
+--reml \
+--save_memory \
+--num_threads 32 \
+--output_file ${base_dir}/result/${pheno}
+
+
+STEP6 Genetic correlation
+
+mph \
+--grm_list /grm_1e4_unrelated/grm_list.txt \
+--phenotype_file all_pheno.csv \
+--trait ${pheno1},${pheno2} \
+--covariate_file cov.csv \
+--covariate_names sex,age,PC1,PC2,PC3,PC4,PC5,PC6,PC7,PC8,PC9,PC10,PC11,PC12,PC13,PC14,PC15,PC16,PC17,PC18,PC19,PC20 \
+--reml \
+--save_memory \
+--num_threads 32 \
+--out /result_rg/${pheno1}_${pheno2}

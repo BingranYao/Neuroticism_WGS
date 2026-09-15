@@ -1,0 +1,57 @@
+# Calculating pairwise variant LD
+cd /path/to/your/project
+for pheno in $pheno_list; do
+    outputpath="./fine_mapping/input_file/ldfile/${pheno}"
+    mkdir -p "$outputpath"
+    while read line; do
+        region=`echo $line | awk '{print \$1}'`
+        chr=$(echo $region | awk -F':' '{print \$1}')
+        snpfile="./fine_mapping/input_file/snplist/${pheno}/${pheno}_${region}.rsid"
+        ./software/plink \
+            --bfile /path/to/reference/data/Q0_unre_Caucasian_c${chr} \
+            --a1-allele /path/to/reference/data/Q0_unre_Caucasian_c${chr}.bim 5 2 \
+            --keep ./data/sample_ids.txt \
+            --extract ${snpfile} \
+            --r inter-chr \
+            --ld-window-r2 0 \
+            --out ${outputpath}/${pheno}_${region}
+    done < ./fine_mapping/pheno_region/${pheno}_merged_regions.txt
+    echo "LD file creation Done: ${pheno}"
+done
+
+# process LD data
+setwd("/path/to/your/project")
+region_tag <- gsub(":", "_", region)
+snp_path <- paste0("./snplist/", pheno, "/", pheno, "_", region_tag, ".rsid")
+ld_path  <- paste0("./LDfile/", pheno, "/", pheno, "_", region_tag, ".ld")
+write_path <- paste0("./LDfile/", pheno, "/", pheno, "_", region_tag, "_matrix.ld")
+
+snp_list <- fread(snp_path, header = FALSE)$V1
+ld_table_data <- fread(ld_path, select = c(3,6,7), header = TRUE)
+ld_matrix_data <- matrix(0, nrow = length(snp_list), ncol = length(snp_list))
+
+idx_a <- match(ld_table_data$SNP_A, snp_list)
+idx_b <- match(ld_table_data$SNP_B, snp_list)
+valid <- complete.cases(idx_a, idx_b)
+
+ld_matrix_data[cbind(idx_a[valid], idx_b[valid])] <- ld_table_data$R[valid]
+ld_matrix_data[cbind(idx_b[valid], idx_a[valid])] <- ld_table_data$R[valid]
+diag(ld_matrix_data) <- 1
+
+fwrite(ld_matrix_data, write_path, row.names = FALSE, col.names = FALSE, sep = " ", quote = FALSE)
+
+# RUN finemap
+library(susieR)
+library(data.table)
+run_susie_rss_save <- function(z_file, ld_file, output_root, L = 10, refine = TRUE, N_sample = 338786) {
+  parts <- strsplit(z_file, "/")[[1]]
+  pheno_name <- parts[length(parts) - 1]
+  region_name <- gsub("\\.z$", "", basename(z_file))
+  sumstat <- fread(z_file, data.table = FALSE)
+  R_matrix <- as.matrix(fread(ld_file, data.table = FALSE))
+  z_scores <- sumstat$beta / sumstat$se
+  susie_fit <- susieR::susie_rss(z = z_scores, R = R_matrix, n = N_sample, L = L, refine = refine)
+  saveRDS(susie_fit, file = output_file)
+  return(list(fit = susie_fit, sumstat = sumstat, pheno = pheno_name, region = region_name))
+}
+
