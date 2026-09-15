@@ -1,1 +1,2 @@
 # Neuroticism_WGS
+This repository contains the analysis scripts used in our whole-genome sequencing (WGS) study of neuroticism. The code covers the major analyses reported in the manuscript, including association testing, sensitivity analyses, statistical fine-mapping with SuSiE, heritability and genetic correlation analyses, spatial mapping with gsMap, colocalization analyses, Mendelian randomization, and phenome-wide association studies (PheWAS). 
